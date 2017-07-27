@@ -94,7 +94,7 @@ public class EventBus {
     //是否处理子类事件，如果为true的时候，假设有一个事件A发送出去
     //而某一个观察者中的处理事件可能为A的父类，那么此时也会进行事件回调
     private final boolean eventInheritance;
-
+    //Builder中注册的索引数量
     private final int indexCount;
 
     /** Convenience singleton for apps using a process-wide EventBus instance. */
@@ -288,6 +288,19 @@ public class EventBus {
     }
 
     /**
+     * 发送一个黏性事件
+     * 这个事件会保留在内存当中，然后如果发送之后还有黏性事件的观察者注册了
+     * 此时该事件也可能会进行回调处理
+     */
+    public void postSticky(Object event) {
+        synchronized (stickyEvents) {
+            stickyEvents.put(event.getClass(), event);//黏性事件会保留在内存当中
+        }
+        //当前先发送事件给之前注册了当前事件的观察者
+        post(event);
+    }
+
+    /**
      * 发送一个事件到事件总线上，并且尝试进行对应的回调
      * @param event 当前需要发送的事件
      * */
@@ -307,8 +320,8 @@ public class EventBus {
                 throw new EventBusException("Internal error. Abort state was not reset");
             }
             try {
-                postSingleEvent(eventQueue.remove(0), postingState);
                 while (!eventQueue.isEmpty()) {//会尝试将当前队列中的所有事件都发送出去
+                    postSingleEvent(eventQueue.remove(0), postingState);
                 }
             } finally {
                 //事件发送完成
@@ -316,117 +329,6 @@ public class EventBus {
                 postingState.isMainThread = false;//每次发送的时候都会重置
             }
         }
-    }
-
-    /**
-     * 用于在观察者的事件回调方法中调用，那么当前事件所对应的后续的观察元素的回调都不会进行
-     * 常用的场景就是高优先级阻断低优先级的执行
-     * 调用这个方法必须要求当前的回调方法是POSTING线程，因为这样才能保证同步性
-     * 这个和postSingleEventForEventType处理的逻辑有关
-     */
-    public void cancelEventDelivery(Object event) {
-        PostingThreadState postingState = currentPostingThreadState.get();
-        //实际上这个方法是用于在事件回调的时候调用的，所以说需要检查当前是否处于事件发送中
-        if (!postingState.isPosting) {
-            throw new EventBusException(
-                    "This method may only be called from inside event handling methods on the posting thread");
-        } else if (event == null) {
-            throw new EventBusException("Event may not be null");
-        } else if (postingState.event != event) {
-            throw new EventBusException("Only the currently handled event may be aborted");
-        } else if (postingState.subscription.subscriberMethod.threadMode != ThreadMode.POSTING) {
-            throw new EventBusException(" event handlers may only abort the incoming event");
-        }
-
-        postingState.canceled = true;
-    }
-
-    /**
-     * 发送一个黏性事件
-     * 这个事件会保留在内存当中，然后如果发送之后还有黏性事件的观察者注册了
-     * 此时该事件也可能会进行回调处理
-     */
-    public void postSticky(Object event) {
-        synchronized (stickyEvents) {
-            stickyEvents.put(event.getClass(), event);//黏性事件会保留在内存当中
-        }
-        //当前先发送事件给之前注册了当前事件的观察者
-        post(event);
-    }
-
-    /**
-     * Gets the most recent sticky event for the given type.
-     *
-     * @see #postSticky(Object)
-     */
-    public <T> T getStickyEvent(Class<T> eventType) {
-        synchronized (stickyEvents) {
-            return eventType.cast(stickyEvents.get(eventType));
-        }
-    }
-
-    /**
-     * Remove and gets the recent sticky event for the given event type.
-     *
-     * @see #postSticky(Object)
-     */
-    public <T> T removeStickyEvent(Class<T> eventType) {
-        synchronized (stickyEvents) {
-            return eventType.cast(stickyEvents.remove(eventType));
-        }
-    }
-
-    /**
-     * Removes the sticky event if it equals to the given event.
-     *
-     * @return true if the events matched and the sticky event was removed.
-     */
-    public boolean removeStickyEvent(Object event) {
-        synchronized (stickyEvents) {
-            Class<?> eventType = event.getClass();
-            Object existingEvent = stickyEvents.get(eventType);
-            if (event.equals(existingEvent)) {
-                stickyEvents.remove(eventType);
-                return true;
-            } else {
-                return false;
-            }
-        }
-    }
-
-    /**
-     * 移除所有黏性事件
-     */
-    public void removeAllStickyEvents() {
-        synchronized (stickyEvents) {
-            stickyEvents.clear();//其实就是从内存中移除
-        }
-    }
-
-    /**
-     * 通过某一个事件来查找是否有观察者
-     * 注意这里默认是会匹配父类和接口的
-     * @param eventClass
-     * @return
-     */
-    public boolean hasSubscriberForEvent(Class<?> eventClass) {
-        //这里并没有通过eventInheritance进行区别
-        //而是默认了查找父类和接口，这个地方需要注意
-        List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
-        if (eventTypes != null) {
-            int countTypes = eventTypes.size();
-            for (int h = 0; h < countTypes; h++) {
-                Class<?> clazz = eventTypes.get(h);
-                CopyOnWriteArrayList<Subscription> subscriptions;
-                synchronized (this) {
-                    subscriptions = subscriptionsByEventType.get(clazz);
-                }
-                if (subscriptions != null && !subscriptions.isEmpty()) {
-                    return true;
-                }
-            }
-        }
-        return false;
     }
 
     /**
@@ -461,6 +363,31 @@ public class EventBus {
                 //当前允许发送NoSubscriberEvent事件，重新走发送流程
                 post(new NoSubscriberEvent(this, event));
             }
+        }
+    }
+
+    /**
+     * 在eventInheritance为true的基础上
+     * 查找原始事件的父类和接口，这意味着如果有观察者观察这些父类和接口，
+     * 那么对于这个原始事件来说他们也是观察的
+     * @param eventClass 原始事件
+     * @return 当前事件实际可以处理的事件集合，包括子类和接口
+     */
+    private static List<Class<?>> lookupAllEventTypes(Class<?> eventClass) {
+        synchronized (eventTypesCache) {
+            List<Class<?>> eventTypes = eventTypesCache.get(eventClass);
+            if (eventTypes == null) {
+                eventTypes = new ArrayList<>();
+                Class<?> clazz = eventClass;
+                while (clazz != null) {//遍历
+                    eventTypes.add(clazz);//首先是记录当前原始事件，如果有后续循环的话会处理会处理父类
+                    //getInterfaces会返回当前类所实现的所有接口
+                    addInterfaces(eventTypes, clazz.getInterfaces());
+                    clazz = clazz.getSuperclass();
+                }
+                eventTypesCache.put(eventClass, eventTypes);
+            }
+            return eventTypes;
         }
     }
 
@@ -538,41 +465,6 @@ public class EventBus {
     }
 
     /**
-     * 在eventInheritance为true的基础上
-     * 查找原始事件的父类和接口，这意味着如果有观察者观察这些父类和接口，
-     * 那么对于这个原始事件来说他们也是观察的
-     * @param eventClass 原始事件
-     * @return 当前事件实际可以处理的事件集合，包括子类和接口
-     */
-    private static List<Class<?>> lookupAllEventTypes(Class<?> eventClass) {
-        synchronized (eventTypesCache) {
-            List<Class<?>> eventTypes = eventTypesCache.get(eventClass);
-            if (eventTypes == null) {
-                eventTypes = new ArrayList<>();
-                Class<?> clazz = eventClass;
-                while (clazz != null) {//遍历
-                    eventTypes.add(clazz);//首先是记录当前原始事件，如果有后续循环的话会处理会处理父类
-                    //getInterfaces会返回当前类所实现的所有接口
-                    addInterfaces(eventTypes, clazz.getInterfaces());
-                    clazz = clazz.getSuperclass();
-                }
-                eventTypesCache.put(eventClass, eventTypes);
-            }
-            return eventTypes;
-        }
-    }
-
-    /** Recurses through super interfaces. */
-    static void addInterfaces(List<Class<?>> eventTypes, Class<?>[] interfaces) {
-        for (Class<?> interfaceClass : interfaces) {
-            if (!eventTypes.contains(interfaceClass)) {
-                eventTypes.add(interfaceClass);
-                addInterfaces(eventTypes, interfaceClass.getInterfaces());//一个接口可能会继承其它接口
-            }
-        }
-    }
-
-    /**
      * 这个用于在Poster里面进行事件回调处理
      * 但是因为存在一些异步的Poster，所以说在进行回调之前还是要检查当前是否unregister
      */
@@ -602,6 +494,114 @@ public class EventBus {
             handleSubscriberException(subscription, event, e.getCause());
         } catch (IllegalAccessException e) {
             throw new IllegalStateException("Unexpected exception", e);
+        }
+    }
+
+    /**
+     * 用于在观察者的事件回调方法中调用，那么当前事件所对应的后续的观察元素的回调都不会进行
+     * 常用的场景就是高优先级阻断低优先级的执行
+     * 调用这个方法必须要求当前的回调方法是POSTING线程，因为这样才能保证同步性
+     * 这个和postSingleEventForEventType处理的逻辑有关
+     */
+    public void cancelEventDelivery(Object event) {
+        PostingThreadState postingState = currentPostingThreadState.get();
+        //实际上这个方法是用于在事件回调的时候调用的，所以说需要检查当前是否处于事件发送中
+        if (!postingState.isPosting) {
+            throw new EventBusException(
+                    "This method may only be called from inside event handling methods on the posting thread");
+        } else if (event == null) {
+            throw new EventBusException("Event may not be null");
+        } else if (postingState.event != event) {
+            throw new EventBusException("Only the currently handled event may be aborted");
+        } else if (postingState.subscription.subscriberMethod.threadMode != ThreadMode.POSTING) {
+            throw new EventBusException(" event handlers may only abort the incoming event");
+        }
+
+        postingState.canceled = true;
+    }
+
+    /**
+     * Gets the most recent sticky event for the given type.
+     *
+     * @see #postSticky(Object)
+     */
+    public <T> T getStickyEvent(Class<T> eventType) {
+        synchronized (stickyEvents) {
+            return eventType.cast(stickyEvents.get(eventType));
+        }
+    }
+
+    /**
+     * Remove and gets the recent sticky event for the given event type.
+     *
+     * @see #postSticky(Object)
+     */
+    public <T> T removeStickyEvent(Class<T> eventType) {
+        synchronized (stickyEvents) {
+            return eventType.cast(stickyEvents.remove(eventType));
+        }
+    }
+
+    /**
+     * Removes the sticky event if it equals to the given event.
+     *
+     * @return true if the events matched and the sticky event was removed.
+     */
+    public boolean removeStickyEvent(Object event) {
+        synchronized (stickyEvents) {
+            Class<?> eventType = event.getClass();
+            Object existingEvent = stickyEvents.get(eventType);
+            if (event.equals(existingEvent)) {
+                stickyEvents.remove(eventType);
+                return true;
+            } else {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * 移除所有黏性事件
+     */
+    public void removeAllStickyEvents() {
+        synchronized (stickyEvents) {
+            stickyEvents.clear();//其实就是从内存中移除
+        }
+    }
+
+    /**
+     * 通过某一个事件来查找是否有观察者
+     * 注意这里默认是会匹配父类和接口的
+     * @param eventClass
+     * @return
+     */
+    public boolean hasSubscriberForEvent(Class<?> eventClass) {
+        //这里并没有通过eventInheritance进行区别
+        //而是默认了查找父类和接口，这个地方需要注意
+        List<Class<?>> eventTypes = lookupAllEventTypes(eventClass);
+        if (eventTypes != null) {
+            int countTypes = eventTypes.size();
+            for (int h = 0; h < countTypes; h++) {
+                Class<?> clazz = eventTypes.get(h);
+                CopyOnWriteArrayList<Subscription> subscriptions;
+                synchronized (this) {
+                    subscriptions = subscriptionsByEventType.get(clazz);
+                }
+                if (subscriptions != null && !subscriptions.isEmpty()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Recurses through super interfaces. */
+    static void addInterfaces(List<Class<?>> eventTypes, Class<?>[] interfaces) {
+        for (Class<?> interfaceClass : interfaces) {
+            if (!eventTypes.contains(interfaceClass)) {
+                eventTypes.add(interfaceClass);
+                addInterfaces(eventTypes, interfaceClass.getInterfaces());//一个接口可能会继承其它接口
+            }
         }
     }
 

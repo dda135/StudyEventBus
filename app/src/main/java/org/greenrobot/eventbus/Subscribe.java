@@ -35,7 +35,7 @@ public @interface Subscribe {
     boolean sticky() default false;
 
     /**
-     * 回调优先级，这个只有对于同样的ThreadMode才有效，优先级高的会先响应事件
+     * 回调优先级，这个只有对于同样的线程才有效，优先级高的会先响应事件
      * */
     int priority() default 0;
 }

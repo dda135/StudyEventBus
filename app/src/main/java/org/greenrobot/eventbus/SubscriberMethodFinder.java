@@ -59,8 +59,8 @@ class SubscriberMethodFinder {
      * @return 该观察者所定义的事件回调方法列表
      */
     List<SubscriberMethod> findSubscriberMethods(Class<?> subscriberClass) {
-        //这个缓存并没有上限，实际使用的时候个人认为最好还是通过类似LruCache的方式进行处理（同步的话可能要处理一下）
-        //如果一味的在反注册的时候移除，这样会导致下一次使用的时候偏慢
+        //如果该观察者之前注册过，但是后来注销了，那么下一次重新注册的时候，直接从缓存中获取即可
+        //不需要每一次都重新查找一遍，效率会好一些
         List<SubscriberMethod> subscriberMethods = METHOD_CACHE.get(subscriberClass);
         if (subscriberMethods != null) {
             return subscriberMethods;
@@ -70,6 +70,7 @@ class SubscriberMethodFinder {
             //忽略索引的话默认使用反射，相对索引来说还是慢不少的
             subscriberMethods = findUsingReflection(subscriberClass);
         } else {
+            //通过索引查找，正常来说索引会在编译器生成，然后会写一个新的文件，里面会通过一个map存储所有结果
             subscriberMethods = findUsingInfo(subscriberClass);
         }
         if (subscriberMethods.isEmpty()) {//如果一个观察者内部没有满足的回调方法，直接抛出异常了
@@ -106,34 +107,12 @@ class SubscriberMethodFinder {
         return getMethodsAndRelease(findState);
     }
 
-    private List<SubscriberMethod> getMethodsAndRelease(FindState findState) {
-        List<SubscriberMethod> subscriberMethods = new ArrayList<>(findState.subscriberMethods);
-        findState.recycle();
-        synchronized (FIND_STATE_POOL) {
-            for (int i = 0; i < POOL_SIZE; i++) {
-                if (FIND_STATE_POOL[i] == null) {
-                    FIND_STATE_POOL[i] = findState;
-                    break;
-                }
-            }
-        }
-        return subscriberMethods;
-    }
-
-    private FindState prepareFindState() {
-        synchronized (FIND_STATE_POOL) {
-            for (int i = 0; i < POOL_SIZE; i++) {
-                FindState state = FIND_STATE_POOL[i];
-                if (state != null) {
-                    FIND_STATE_POOL[i] = null;
-                    return state;
-                }
-            }
-        }
-        return new FindState();
-    }
-
+    /**
+     * 通过索引从某一个观察者中获取所有可以处理事件的函数
+     * @param findState 用于存储查找结果
+     */
     private SubscriberInfo getSubscriberInfo(FindState findState) {
+        //之前在匹配索引的时候，可能当前class是之前事件的父类，那么这个时候可能有缓存
         if (findState.subscriberInfo != null && findState.subscriberInfo.getSuperSubscriberInfo() != null) {
             SubscriberInfo superclassInfo = findState.subscriberInfo.getSuperSubscriberInfo();
             if (findState.clazz == superclassInfo.getSubscriberClass()) {
@@ -141,7 +120,7 @@ class SubscriberMethodFinder {
             }
         }
         if (subscriberInfoIndexes != null) {
-            for (SubscriberInfoIndex index : subscriberInfoIndexes) {
+            for (SubscriberInfoIndex index : subscriberInfoIndexes) {//从索引中获取
                 SubscriberInfo info = index.getSubscriberInfo(findState.clazz);
                 if (info != null) {
                     return info;
@@ -155,7 +134,6 @@ class SubscriberMethodFinder {
      * 通过反射来找观察者中的用于回调事件的方法
      * 注意这个是会去找观察者的父类
      * @param subscriberClass 观察者
-     * @return
      */
     private List<SubscriberMethod> findUsingReflection(Class<?> subscriberClass) {
         FindState findState = prepareFindState();
@@ -167,6 +145,10 @@ class SubscriberMethodFinder {
         return getMethodsAndRelease(findState);
     }
 
+    /**
+     * 通过反射指定的注解来从某一个观察者中获取所有可以处理事件的函数
+     * @param findState 用于存储查找结果
+     */
     private void findUsingReflectionInSingleClass(FindState findState) {
         Method[] methods;
         try {
@@ -206,6 +188,33 @@ class SubscriberMethodFinder {
                         " is a illegal @Subscribe method: must be public, non-static, and non-abstract");
             }
         }
+    }
+
+    private List<SubscriberMethod> getMethodsAndRelease(FindState findState) {
+        List<SubscriberMethod> subscriberMethods = new ArrayList<>(findState.subscriberMethods);
+        findState.recycle();
+        synchronized (FIND_STATE_POOL) {
+            for (int i = 0; i < POOL_SIZE; i++) {
+                if (FIND_STATE_POOL[i] == null) {
+                    FIND_STATE_POOL[i] = findState;
+                    break;
+                }
+            }
+        }
+        return subscriberMethods;
+    }
+
+    private FindState prepareFindState() {
+        synchronized (FIND_STATE_POOL) {
+            for (int i = 0; i < POOL_SIZE; i++) {
+                FindState state = FIND_STATE_POOL[i];
+                if (state != null) {
+                    FIND_STATE_POOL[i] = null;
+                    return state;
+                }
+            }
+        }
+        return new FindState();
     }
 
     static void clearCaches() {
